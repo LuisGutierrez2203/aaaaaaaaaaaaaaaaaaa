@@ -7,9 +7,9 @@ import threading
 from datetime import datetime
 
 import cv2
-import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
+from deepface import DeepFace
 from tkinter import messagebox, ttk
 from ultralytics import YOLO
 
@@ -24,9 +24,6 @@ PLACA_DIR = os.path.join(BASE_DIR, "Placa")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 REGISTROS_PATH = os.path.join(BASE_DIR, "registros_acceso.csv")
 MODEL_DIR = os.path.join(ROOT_DIR, "Modelos_IA")
-EMBEDDING_FILE = "face_embedding.npy"
-FACE_THRESHOLD_SFACE = 0.38
-FACE_THRESHOLD_FALLBACK = 0.20
 
 for carpeta in (PLACA_DIR, STATIC_DIR):
     os.makedirs(carpeta, exist_ok=True)
@@ -46,45 +43,37 @@ def _primera_ruta_existente(candidatos):
     return None
 
 
-class FaceVerifier:
+class OpenCVFaceDetector:
     def __init__(self):
-        self.mode = "fallback"
+        self.mode = "haar"
         self.detector = None
-        self.recognizer = None
         self.yunet_path = _primera_ruta_existente(
             (
                 "face_detection_yunet_2023mar.onnx",
                 "face_detection_yunet_2022mar.onnx",
             )
         )
-        self.sface_path = _primera_ruta_existente(("face_recognition_sface_2021dec.onnx",))
         self.cascade = cv2.CascadeClassifier(
             os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
         )
 
-        if (
-            hasattr(cv2, "FaceDetectorYN_create")
-            and hasattr(cv2, "FaceRecognizerSF_create")
-            and self.yunet_path
-            and self.sface_path
-        ):
+        if hasattr(cv2, "FaceDetectorYN_create") and self.yunet_path:
             try:
                 self.detector = cv2.FaceDetectorYN_create(
                     self.yunet_path, "", (320, 320), 0.85, 0.3, 5000
                 )
-                self.recognizer = cv2.FaceRecognizerSF_create(self.sface_path, "")
-                self.mode = "sface"
+                self.mode = "yunet"
             except Exception:
-                self.mode = "fallback"
+                self.mode = "haar"
 
-        print(f"[FaceVerifier] Modo activo: {self.mode}")
-        if self.mode != "sface":
+        print(f"[OpenCVFaceDetector] Modo activo: {self.mode}")
+        if self.mode != "yunet":
             print(
-                "[FaceVerifier] Para modo rapido/preciso, agrega en Modelos_IA: "
-                "face_detection_yunet_2023mar.onnx y face_recognition_sface_2021dec.onnx"
+                "[OpenCVFaceDetector] Para deteccion mas robusta agrega "
+                "face_detection_yunet_2023mar.onnx en Modelos_IA."
             )
 
-    def _detectar_con_sface(self, frame_rgb):
+    def _detectar_yunet(self, frame_rgb):
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         h, w = frame_bgr.shape[:2]
         self.detector.setInputSize((w, h))
@@ -101,11 +90,9 @@ class FaceVerifier:
         crop_rgb = frame_rgb[y : y + ch, x : x + cw]
         if crop_rgb.size == 0:
             return None
+        return {"bbox": (x, y, cw, ch), "crop_rgb": crop_rgb}
 
-        aligned_bgr = self.recognizer.alignCrop(frame_bgr, cara)
-        return {"bbox": (x, y, cw, ch), "crop_rgb": crop_rgb, "aligned_bgr": aligned_bgr}
-
-    def _detectar_con_fallback(self, frame_rgb):
+    def _detectar_haar(self, frame_rgb):
         if self.cascade.empty():
             return None
 
@@ -121,63 +108,17 @@ class FaceVerifier:
         crop_rgb = frame_rgb[y : y + ch, x : x + cw]
         if crop_rgb.size == 0:
             return None
-        return {"bbox": (x, y, cw, ch), "crop_rgb": crop_rgb, "aligned_bgr": None}
+        return {"bbox": (x, y, cw, ch), "crop_rgb": crop_rgb}
 
-    def detectar_rostro(self, frame_rgb):
+    def detectar(self, frame_rgb):
         if frame_rgb is None:
             return None
-        if self.mode == "sface":
-            return self._detectar_con_sface(frame_rgb)
-        return self._detectar_con_fallback(frame_rgb)
-
-    @staticmethod
-    def _embedding_fallback(crop_rgb):
-        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-        gray = cv2.resize(gray, (112, 112), interpolation=cv2.INTER_AREA)
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag, ang = cv2.cartToPolar(gx, gy, angleInDegrees=False)
-        bins = 16
-        bin_ids = np.int32(bins * ang / (2 * np.pi))
-        hist = np.zeros(bins, dtype=np.float32)
-        for b, m in zip(bin_ids.flatten(), mag.flatten()):
-            hist[min(int(b), bins - 1)] += float(m)
-        norm = np.linalg.norm(hist)
-        if norm <= 1e-6:
-            return None
-        return hist / norm
-
-    def extraer_embedding(self, frame_rgb):
-        deteccion = self.detectar_rostro(frame_rgb)
-        if deteccion is None:
-            return None, None, "No se ha detectado cara. Acerquese y mire directo a la camara."
-
-        if self.mode == "sface":
-            feat = self.recognizer.feature(deteccion["aligned_bgr"])
-            if feat is None:
-                return None, None, "No se pudo extraer embedding facial."
-            embedding = feat.flatten().astype(np.float32)
-            norm = np.linalg.norm(embedding)
-            if norm <= 1e-6:
-                return None, None, "Embedding facial invalido."
-            embedding = embedding / norm
-        else:
-            embedding = self._embedding_fallback(deteccion["crop_rgb"])
-            if embedding is None:
-                return None, None, "No se pudo calcular descriptor facial."
-
-        return embedding, deteccion["crop_rgb"], None
-
-    def comparar_embeddings(self, embedding_ref, embedding_cap):
-        ref = embedding_ref.astype(np.float32).flatten()
-        cap = embedding_cap.astype(np.float32).flatten()
-        cosine = float(np.dot(ref, cap) / ((np.linalg.norm(ref) * np.linalg.norm(cap)) + 1e-8))
-        distancia = 1.0 - cosine
-        umbral = FACE_THRESHOLD_SFACE if self.mode == "sface" else FACE_THRESHOLD_FALLBACK
-        return distancia <= umbral, distancia, umbral
+        if self.mode == "yunet":
+            return self._detectar_yunet(frame_rgb)
+        return self._detectar_haar(frame_rgb)
 
 
-FACE_VERIFIER = FaceVerifier()
+FACE_DETECTOR = OpenCVFaceDetector()
 
 
 def formatear_fecha_hora(fecha_hora):
@@ -194,21 +135,6 @@ def registrar_evento(tipo, placa, fecha_hora, estado, detalle):
             )
         fecha, hora = formatear_fecha_hora(fecha_hora)
         writer.writerow([tipo, placa, fecha, hora, estado, detalle, fecha_hora.isoformat()])
-
-
-def cargar_embedding(ruta_placa):
-    ruta_embedding = os.path.join(ruta_placa, EMBEDDING_FILE)
-    if not os.path.exists(ruta_embedding):
-        return None
-    try:
-        return np.load(ruta_embedding)
-    except Exception:
-        return None
-
-
-def guardar_embedding(ruta_placa, embedding):
-    ruta_embedding = os.path.join(ruta_placa, EMBEDDING_FILE)
-    np.save(ruta_embedding, embedding.astype(np.float32))
 
 
 class App(tk.Tk):
@@ -276,7 +202,7 @@ class VentanaIngresoVehiculo(tk.Frame):
         )
         ttk.Label(
             self,
-            text="Capture rostro y placa para registrar un ingreso autorizado.",
+            text="OpenCV valida rostro | DeepFace compara identidad",
             style="SubTitle.TLabel",
         ).grid(row=1, column=0, columnspan=3, pady=(0, 12))
 
@@ -297,7 +223,7 @@ class VentanaIngresoVehiculo(tk.Frame):
 
         self.label_estado = ttk.Label(
             self,
-            text=f"Estado: Esperando captura | Motor facial: {FACE_VERIFIER.mode}",
+            text=f"Estado: Esperando captura | Detector OpenCV: {FACE_DETECTOR.mode}",
             style="Status.TLabel",
         )
         self.label_estado.grid(row=6, column=0, columnspan=3, pady=(2, 8))
@@ -324,7 +250,6 @@ class VentanaIngresoVehiculo(tk.Frame):
 
         txt_placa = resultado["placa"].strip()
         img_rostro = resultado["rostro_crop"]
-        face_embedding = resultado["face_embedding"]
         fecha_hora = resultado["fecha_hora"]
         fecha, hora = formatear_fecha_hora(fecha_hora)
 
@@ -355,7 +280,6 @@ class VentanaIngresoVehiculo(tk.Frame):
             )
             return
 
-        guardar_embedding(ruta_placa, face_embedding)
         registrar_evento("INGRESO", txt_placa, fecha_hora, "AUTORIZADO", "Registro de ingreso exitoso")
         messagebox.showinfo(
             "Ingreso registrado", f"Vehiculo {txt_placa} registrado el {fecha} a las {hora}."
@@ -377,7 +301,7 @@ class VentanaSalidaVehiculo(tk.Frame):
         )
         ttk.Label(
             self,
-            text="Se valida el rostro capturado contra el registro de ingreso.",
+            text="OpenCV valida rostro actual | DeepFace confirma identidad",
             style="SubTitle.TLabel",
         ).grid(row=1, column=0, columnspan=3, pady=(0, 12))
 
@@ -408,7 +332,7 @@ class VentanaSalidaVehiculo(tk.Frame):
 
         self.label_estado = ttk.Label(
             self,
-            text=f"Estado: Esperando validacion | Motor facial: {FACE_VERIFIER.mode}",
+            text=f"Estado: Esperando validacion | Detector OpenCV: {FACE_DETECTOR.mode}",
             style="Status.TLabel",
         )
         self.label_estado.grid(row=7, column=0, columnspan=3, pady=(2, 8))
@@ -444,7 +368,7 @@ class VentanaSalidaVehiculo(tk.Frame):
             return
 
         txt_placa = resultado["placa"].strip()
-        face_embedding_cap = resultado["face_embedding"]
+        img_rostro = resultado["rostro_crop"]
         fecha_hora = resultado["fecha_hora"]
         fecha, hora = formatear_fecha_hora(fecha_hora)
 
@@ -478,47 +402,40 @@ class VentanaSalidaVehiculo(tk.Frame):
         ruta_rostro_registrado = os.path.join(ruta_placa, rostros_registrados[0])
         self.mostrar_rostro_registrado(ruta_rostro_registrado)
 
-        embedding_ref = cargar_embedding(ruta_placa)
-        if embedding_ref is None:
-            img_ref_bgr = cv2.imread(ruta_rostro_registrado)
-            if img_ref_bgr is None:
-                mensaje = "No se pudo cargar el rostro registrado."
-                self.label_estado.config(text=f"Estado: {mensaje}")
-                messagebox.showerror("Error de validacion", mensaje)
-                registrar_evento("SALIDA", txt_placa, fecha_hora, "ERROR", mensaje)
-                return
-            img_ref_rgb = cv2.cvtColor(img_ref_bgr, cv2.COLOR_BGR2RGB)
-            embedding_ref, _, error = FACE_VERIFIER.extraer_embedding(img_ref_rgb)
-            if error is not None:
-                mensaje = f"Rostro registrado invalido: {error}"
-                self.label_estado.config(text=f"Estado: {mensaje}")
-                messagebox.showwarning("Salida denegada", mensaje)
-                registrar_evento("SALIDA", txt_placa, fecha_hora, "RECHAZADO", mensaje)
-                return
-            guardar_embedding(ruta_placa, embedding_ref)
-
-        verificado, distancia, umbral = FACE_VERIFIER.comparar_embeddings(
-            embedding_ref, face_embedding_cap
+        ruta_rostro_capt = os.path.join(
+            STATIC_DIR, f"cap_rostro_{fecha_hora.strftime('%Y%m%d_%H%M%S')}.jpg"
         )
-        detalle_distancia = f"dist={distancia:.4f} umbral={umbral:.4f}"
+        cv2.imwrite(ruta_rostro_capt, cv2.cvtColor(img_rostro, cv2.COLOR_RGB2BGR))
 
-        if verificado:
-            self.label_estado.config(text=f"Estado: Salida autorizada ({detalle_distancia})")
-            messagebox.showinfo("Salida autorizada", f"Vehiculo {txt_placa} validado y liberado.")
-            registrar_evento(
-                "SALIDA",
-                txt_placa,
-                fecha_hora,
-                "AUTORIZADO",
-                f"Rostro verificado ({detalle_distancia})",
+        try:
+            valid_rostro = DeepFace.verify(
+                img1_path=ruta_rostro_registrado,
+                img2_path=ruta_rostro_capt,
+                model_name="Facenet",
+                detector_backend="opencv",
+                enforce_detection=False,
             )
-            shutil.rmtree(ruta_placa)
-            return
 
-        mensaje = f"Rostro no coincide con el registro ({detalle_distancia})."
-        self.label_estado.config(text=f"Estado: {mensaje}")
-        messagebox.showwarning("Salida denegada", mensaje)
-        registrar_evento("SALIDA", txt_placa, fecha_hora, "RECHAZADO", mensaje)
+            if valid_rostro.get("verified"):
+                self.label_estado.config(text="Estado: Salida autorizada (DeepFace)")
+                messagebox.showinfo("Salida autorizada", f"Vehiculo {txt_placa} validado y liberado.")
+                registrar_evento(
+                    "SALIDA",
+                    txt_placa,
+                    fecha_hora,
+                    "AUTORIZADO",
+                    "Rostro verificado correctamente con DeepFace",
+                )
+                shutil.rmtree(ruta_placa)
+                return
+
+            mensaje = "Rostro no coincide con el registro (DeepFace)."
+            self.label_estado.config(text=f"Estado: {mensaje}")
+            messagebox.showwarning("Salida denegada", mensaje)
+            registrar_evento("SALIDA", txt_placa, fecha_hora, "RECHAZADO", mensaje)
+        finally:
+            if os.path.exists(ruta_rostro_capt):
+                os.remove(ruta_rostro_capt)
 
 
 class Captura_camara:
@@ -614,9 +531,12 @@ class Captura_camara:
         if self.cap_rostro is None or self.cap_placa is None:
             return {"ok": False, "error": "No hay imagen disponible de las camaras."}
 
-        face_embedding, face_crop, error_rostro = FACE_VERIFIER.extraer_embedding(self.cap_rostro)
-        if error_rostro is not None:
-            return {"ok": False, "error": error_rostro}
+        deteccion_rostro = FACE_DETECTOR.detectar(self.cap_rostro)
+        if deteccion_rostro is None:
+            return {
+                "ok": False,
+                "error": "No se ha detectado cara. Acerquese y mire directo a la camara.",
+            }
 
         ruta_capt_placa = os.path.join(STATIC_DIR, "capt_placa.jpg")
         cv2.imwrite(ruta_capt_placa, cv2.cvtColor(self.cap_placa, cv2.COLOR_RGB2BGR))
@@ -647,9 +567,7 @@ class Captura_camara:
             return {
                 "ok": True,
                 "placa": txt_placa,
-                "rostro": self.cap_rostro.copy(),
-                "rostro_crop": face_crop.copy(),
-                "face_embedding": face_embedding.copy(),
+                "rostro_crop": deteccion_rostro["crop_rgb"].copy(),
                 "fecha_hora": datetime.now(),
             }
         finally:
