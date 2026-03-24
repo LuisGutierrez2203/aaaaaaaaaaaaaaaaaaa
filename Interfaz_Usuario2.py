@@ -447,6 +447,7 @@ class Captura_camara:
         self.canvas_placa_cap = canv2
         self.cam_encendido = True
         self.after_id = None
+        self.frame_lock = threading.Lock()
 
     def capturar(self):
         self.hilo_rostro = threading.Thread(target=self.cap_camara, args=(cap1, 0), daemon=True)
@@ -460,13 +461,18 @@ class Captura_camara:
             ret, cap_cam = cap.read()
             if ret:
                 frame_cap = cv2.cvtColor(cap_cam, cv2.COLOR_BGR2RGB)
-                if index == 0:
-                    self.cap_rostro = frame_cap
-                else:
-                    self.cap_placa = frame_cap
+                with self.frame_lock:
+                    if index == 0:
+                        self.cap_rostro = frame_cap
+                    else:
+                        self.cap_placa = frame_cap
 
     def actualizar_frame(self):
-        if self.cap_rostro is not None:
+        with self.frame_lock:
+            frame_rostro_src = None if self.cap_rostro is None else self.cap_rostro.copy()
+            frame_placa_src = None if self.cap_placa is None else self.cap_placa.copy()
+
+        if frame_rostro_src is not None:
             if self.canvas_rostro_cap.winfo_exists():
                 canvas_width_rostro = self.canvas_rostro_cap.winfo_width()
                 canvas_height_rostro = self.canvas_rostro_cap.winfo_height()
@@ -476,7 +482,7 @@ class Captura_camara:
                 return
 
             frame_rostro = cv2.resize(
-                self.cap_rostro,
+                frame_rostro_src,
                 (canvas_width_rostro, canvas_height_rostro),
                 interpolation=cv2.INTER_AREA,
             )
@@ -485,7 +491,7 @@ class Captura_camara:
             self.canvas_rostro_cap.create_image(0, 0, anchor=tk.NW, image=imgtk_rostro)
             self.canvas_rostro_cap.imgtk = imgtk_rostro
 
-        if self.cap_placa is not None:
+        if frame_placa_src is not None:
             if self.canvas_placa_cap.winfo_exists():
                 canvas_width_placa = self.canvas_placa_cap.winfo_width()
                 canvas_height_placa = self.canvas_placa_cap.winfo_height()
@@ -495,7 +501,7 @@ class Captura_camara:
                 return
 
             frame_placa = cv2.resize(
-                self.cap_placa,
+                frame_placa_src,
                 (canvas_width_placa, canvas_height_placa),
                 interpolation=cv2.INTER_AREA,
             )
@@ -528,10 +534,14 @@ class Captura_camara:
         return placas
 
     def cap(self):
-        if self.cap_rostro is None or self.cap_placa is None:
+        with self.frame_lock:
+            rostro_snapshot = None if self.cap_rostro is None else self.cap_rostro.copy()
+            placa_snapshot = None if self.cap_placa is None else self.cap_placa.copy()
+
+        if rostro_snapshot is None or placa_snapshot is None:
             return {"ok": False, "error": "No hay imagen disponible de las camaras."}
 
-        deteccion_rostro = FACE_DETECTOR.detectar(self.cap_rostro)
+        deteccion_rostro = FACE_DETECTOR.detectar(rostro_snapshot)
         if deteccion_rostro is None:
             return {
                 "ok": False,
@@ -539,7 +549,7 @@ class Captura_camara:
             }
 
         ruta_capt_placa = os.path.join(STATIC_DIR, "capt_placa.jpg")
-        cv2.imwrite(ruta_capt_placa, cv2.cvtColor(self.cap_placa, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(ruta_capt_placa, cv2.cvtColor(placa_snapshot, cv2.COLOR_RGB2BGR))
 
         try:
             imagen_placa = cv2.cvtColor(cv2.imread(ruta_capt_placa), cv2.COLOR_BGR2RGB)
@@ -568,7 +578,7 @@ class Captura_camara:
                 "ok": True,
                 "placa": txt_placa,
                 "rostro_crop": deteccion_rostro["crop_rgb"].copy(),
-                "rostro_full": self.cap_rostro.copy(),
+                "rostro_full": rostro_snapshot,
                 "fecha_hora": datetime.now(),
             }
         finally:
