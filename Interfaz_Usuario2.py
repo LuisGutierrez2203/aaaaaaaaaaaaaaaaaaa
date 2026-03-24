@@ -249,7 +249,7 @@ class VentanaIngresoVehiculo(tk.Frame):
             return
 
         txt_placa = resultado["placa"].strip()
-        img_rostro = resultado["rostro_crop"]
+        img_rostro = resultado["rostro_full"]
         fecha_hora = resultado["fecha_hora"]
         fecha, hora = formatear_fecha_hora(fecha_hora)
 
@@ -368,7 +368,7 @@ class VentanaSalidaVehiculo(tk.Frame):
             return
 
         txt_placa = resultado["placa"].strip()
-        img_rostro = resultado["rostro_crop"]
+        img_rostro = resultado["rostro_full"]
         fecha_hora = resultado["fecha_hora"]
         fecha, hora = formatear_fecha_hora(fecha_hora)
 
@@ -568,6 +568,7 @@ class Captura_camara:
                 "ok": True,
                 "placa": txt_placa,
                 "rostro_crop": deteccion_rostro["crop_rgb"].copy(),
+                "rostro_full": self.cap_rostro.copy(),
                 "fecha_hora": datetime.now(),
             }
         finally:
